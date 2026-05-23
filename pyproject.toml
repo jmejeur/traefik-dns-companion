@@ -1,0 +1,16 @@
+[project]
+name = "traefik-dns-companion"
+version = "0.1.0"
+requires-python = ">=3.14"
+
+[tool.mypy]
+python_version = "3.14"
+disallow_untyped_defs = true
+disallow_incomplete_defs = true
+warn_return_any = true
+warn_unused_ignores = true
+strict_equality = true
+
+[[tool.mypy.overrides]]
+module = ["docker.*"]
+ignore_missing_imports = true
