@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import ipaddress
 import logging
+from concurrent.futures import ThreadPoolExecutor
 from typing import Any
 
 import requests
@@ -36,7 +37,8 @@ def _fetch_ip_from(url: str) -> str:
 
 def _fetch_ip_quorum() -> str:
     """Ask all sources; return an IP agreed on by a strict majority or '' if none."""
-    results = [_fetch_ip_from(url) for url in _DDNS_SOURCES]
+    with ThreadPoolExecutor(max_workers=len(_DDNS_SOURCES)) as pool:
+        results = list(pool.map(_fetch_ip_from, _DDNS_SOURCES))
     for ip in set(results):
         if ip and results.count(ip) >= _DDNS_QUORUM:
             return ip
@@ -87,6 +89,7 @@ class CloudflareBackend:
         self._source_index: int = 0
         self.name = f"cloudflare-{provider}"
         self.opt_in = opt_in
+        self._session = requests.Session()
 
     def refresh_ip(self) -> bool:
         if not self._ddns:
@@ -130,7 +133,7 @@ class CloudflareBackend:
         return True
 
     def _cf(self, method: str, path: str, **kw: Any) -> Any:
-        return _http(method, f"{CF_API}{path}", token=self._token, **kw)
+        return _http(method, f"{CF_API}{path}", token=self._token, session=self._session, **kw)
 
     def _zone_for(self, fqdn: str) -> str | None:
         if self._single_zone:
@@ -188,6 +191,17 @@ class CloudflareBackend:
         if self._ddns and not self._ddns_ip:
             log.warning("cloudflare DDNS: no IP available for %s — skipping", fqdn)
             return
+
+        resp = self._cf(
+            "GET", f"/zones/{zone_id}/dns_records",
+            params={"name": fqdn}
+        )
+        existing = resp.get("result", []) if isinstance(resp, dict) else []
+        for r in existing:
+            if isinstance(r, dict) and r.get("comment") != DESCRIPTION:
+                log.warning("cloudflare: skipping %s — conflicting non-companion record exists", fqdn)
+                return
+
         body = self._record_body(fqdn)
         self._cf("POST", f"/zones/{zone_id}/dns_records", json=body)
         log.info("cloudflare: added  %s %s → %s", body["type"], fqdn, body["content"])

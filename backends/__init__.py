@@ -24,13 +24,18 @@ def _http(
     url: str,
     token: str | None = None,
     auth: tuple[str, str] | None = None,
-    verify: bool = True,
+    verify: bool | str = True,
+    session: requests.Session | None = None,
     **kw: Any,
 ) -> Any:
     headers = {"Authorization": f"Bearer {token}"} if token else {}
     for attempt in range(3):
-        r = requests.request(method, url, headers=headers, auth=auth,
-                             verify=verify, timeout=15, **kw)
+        if session:
+            r = session.request(method, url, headers=headers, auth=auth,
+                                verify=verify, timeout=15, **kw)
+        else:
+            r = requests.request(method, url, headers=headers, auth=auth,
+                                 verify=verify, timeout=15, **kw)
         if r.status_code < 500 or attempt == 2:
             r.raise_for_status()
             return r.json()
@@ -62,11 +67,13 @@ def build_backends(env: Mapping[str, str]) -> list[Backend]:
             if not env.get(var):
                 raise SystemExit(f"Unbound backend requires {var}")
         enable_ipv6 = env.get("ENABLE_IPV6", "false").lower() == "true"
+        ca_cert = env.get("UNBOUND_CA_CERT", "")
+        verify: bool | str = ca_cert if ca_cert else env.get("UNBOUND_TLS_VERIFY", "false").lower() == "true"
         active.append(UnboundBackend(
             url=env["UNBOUND_URL"],
             key=env["UNBOUND_API_KEY"],
             secret=env["UNBOUND_API_SECRET"],
-            verify=env.get("UNBOUND_TLS_VERIFY", "false").lower() == "true",
+            verify=verify,
             ipv6=env.get("TRAEFIK_IPV6") if enable_ipv6 else None,
         ))
 
@@ -139,6 +146,12 @@ def build_backends(env: Mapping[str, str]) -> list[Backend]:
             if cf_default not in ("tunnel", "direct", "proxied"):
                 raise SystemExit(
                     f"CF_DEFAULT must be tunnel, direct, or proxied (got {cf_default!r})"
+                )
+            active_names = {p.name for p in cf_providers}
+            if f"cloudflare-{cf_default}" not in active_names:
+                raise SystemExit(
+                    f"CF_DEFAULT={cf_default!r} does not match any active provider "
+                    f"(active: {sorted(n.split('-', 1)[1] for n in active_names)})"
                 )
             for p in cf_providers:
                 if p.name != f"cloudflare-{cf_default}":
