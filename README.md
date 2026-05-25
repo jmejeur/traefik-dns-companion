@@ -1,5 +1,11 @@
 # traefik-dns-companion
 
+[![GitHub Release](https://img.shields.io/github/v/release/jmejeur/traefik-dns-companion)](https://github.com/jmejeur/traefik-dns-companion/releases)
+[![License: MIT](https://img.shields.io/github/license/jmejeur/traefik-dns-companion)](https://github.com/jmejeur/traefik-dns-companion/blob/main/LICENSE)
+[![GitHub Stars](https://img.shields.io/github/stars/jmejeur/traefik-dns-companion?style=flat)](https://github.com/jmejeur/traefik-dns-companion/stargazers)
+[![Container](https://img.shields.io/badge/ghcr.io-traefik--dns--companion-blue?logo=docker)](https://github.com/jmejeur/traefik-dns-companion/pkgs/container/traefik-dns-companion)
+[![Python](https://img.shields.io/badge/python-3.14-blue?logo=python)](https://www.python.org/)
+
 Watches Docker Swarm service labels and keeps DNS backends in sync with Traefik `Host()` router rules. Reacts immediately to service create/update/remove events, with a full reconcile every 1 hour as a fallback.
 
 Supported backends:
@@ -84,7 +90,8 @@ OPNsense and pfSense both expose the same Unbound REST API.
 | `UNBOUND_URL` | Yes (if using) | — | Base URL of your OPNsense or pfSense host, e.g. `https://opnsense.lan` |
 | `UNBOUND_API_KEY` | Yes (if using) | — | API key |
 | `UNBOUND_API_SECRET` | Yes (if using) | — | API secret |
-| `UNBOUND_TLS_VERIFY` | No | `false` | Set to `true` once your firewall has a valid TLS cert |
+| `UNBOUND_TLS_VERIFY` | No | `false` | Set to `true` once your firewall has a valid TLS cert (trusted CA) |
+| `UNBOUND_CA_CERT` | No | — | Path to a CA bundle PEM file for TLS verification (use instead of `UNBOUND_TLS_VERIFY` when your firewall uses a self-signed cert) |
 
 ### Cloudflare backend
 
@@ -342,6 +349,39 @@ services:
           - node.role == manager
 ```
 
+## Security Considerations
+
+### Trust Boundaries and DNS Authority
+The companion reads Traefik `.rule` labels from any discovered container/service and creates DNS records for them. There is **no allowlist**. Anyone who can deploy a container or service in your environment can claim arbitrary hostnames—including subdomains of your Cloudflare zones—and point them to their own containers. In single-tenant homelabs this is fine, but in multi-tenant environments this is a privilege escalation path. You can use the `dns.backends: none` label to opt a service out, but you cannot restrict which hostnames a service is allowed to claim.
+
+### Docker Socket Access
+The companion requires access to the Docker socket to read container/service labels. Access to the Docker socket is equivalent to **root access on the host**. If the companion container is compromised, the attacker can take full control of the Docker host. We recommend using a Docker Socket Proxy (as shown in the Standalone Docker example) to restrict API access to read-only events and container inspections.
+
+If you configure `DOCKER_HOST` to point to a remote daemon (e.g., `tcp://socket-proxy:2375`), note that port 2375 is unencrypted by default. All Docker API traffic will be transmitted in plaintext. Use port 2376 with TLS if communicating over an untrusted network.
+
+### TLS Verification for Unbound
+By default, `UNBOUND_TLS_VERIFY` is `false`. This is a pragmatic default because most OPNsense/pfSense firewalls ship with self-signed certificates, but it means the API calls — which carry your API key and secret as HTTP Basic Auth — are vulnerable to Man-In-The-Middle (MITM) attacks on your LAN segment. The recommended paths, in order of preference:
+
+**Best: use a trusted certificate.** If your firewall has a certificate signed by a public CA (e.g. via Let's Encrypt with the ACME plugin) or by an internal CA that your systems already trust, set:
+
+```yaml
+environment:
+  UNBOUND_TLS_VERIFY: "true"
+```
+
+**Good: pin the self-signed CA.** Export the CA certificate from OPNsense (**System → Trust → Authorities**, export as PEM) and mount it into the container. Set `UNBOUND_CA_CERT` to the in-container path instead of using `UNBOUND_TLS_VERIFY`:
+
+```yaml
+environment:
+  UNBOUND_CA_CERT: /run/secrets/opnsense-ca.pem
+secrets:
+  - opnsense-ca.pem
+```
+
+When `UNBOUND_CA_CERT` is set, it takes precedence over `UNBOUND_TLS_VERIFY` — the companion verifies the server certificate against your CA bundle rather than the system trust store. The TLS insecure warning is also suppressed.
+
+**Avoid: disable verification (default).** Leaving `UNBOUND_TLS_VERIFY=false` and omitting `UNBOUND_CA_CERT` silences urllib3 warnings and skips certificate validation entirely. This is the default only because it requires no firewall configuration changes; it should be treated as a temporary starting point, not a permanent setting.
+
 ## Development
 
 ```bash
@@ -353,6 +393,10 @@ uv run pytest
 ## Releases
 
 Images are published to `ghcr.io/jmejeur/traefik-dns-companion` on every version tag (`v*`). Tags follow semver: `2.0.0` and `2.0`.
+
+## Contributors
+
+[![Contributors](https://contrib.rocks/image?repo=jmejeur/traefik-dns-companion)](https://github.com/jmejeur/traefik-dns-companion/graphs/contributors)
 
 ## License
 

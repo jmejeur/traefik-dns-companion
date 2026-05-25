@@ -48,7 +48,7 @@ except ValueError:
     raise SystemExit(1)
 
 DRY_RUN        = os.environ.get("DRY_RUN", "false").lower() == "true"
-HEARTBEAT_FILE = "/tmp/heartbeat"
+HEARTBEAT_FILE = os.environ.get("HEARTBEAT_FILE", "/tmp/heartbeat")
 DOCKER_MODE    = os.environ.get("DOCKER_MODE", "auto").lower()
 if DOCKER_MODE not in ("swarm", "standalone", "auto"):
     raise SystemExit(f"DOCKER_MODE must be 'swarm', 'standalone', or 'auto' (got {DOCKER_MODE!r})")
@@ -78,12 +78,23 @@ else:
     _noop = _NoOp()
     _sync_total = _records_managed = _sync_duration = _last_sync = _ip_changes = _noop
 
-if os.environ.get("UNBOUND_TLS_VERIFY", "false").lower() != "true":
+if (os.environ.get("UNBOUND_TLS_VERIFY", "false").lower() != "true"
+        and not os.environ.get("UNBOUND_CA_CERT")):
     urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+    log.warning("TLS verification is disabled. Connection to Unbound may be insecure.")
 
 _HOST_BLOCK_RE = re.compile(r'\bHost\s*\(([^)]*)\)', re.IGNORECASE)
 _BACKTICK_RE   = re.compile(r'`([^`]+)`')
+_VALID_FQDN_RE = re.compile(
+    r'^(?!-)[a-zA-Z0-9-]{1,63}(?<!-)(\.[a-zA-Z0-9-]{1,63})*$'
+)
 sync_lock      = threading.Lock()
+_shutdown      = threading.Event()
+
+
+def _is_valid_fqdn(hostname: str) -> bool:
+    """Validate hostname per RFC 1123."""
+    return bool(hostname) and len(hostname) <= 253 and _VALID_FQDN_RE.match(hostname) is not None
 
 
 def _hosts_from_rule(rule: str) -> set[str]:
@@ -91,7 +102,11 @@ def _hosts_from_rule(rule: str) -> set[str]:
     hosts: set[str] = set()
     for block in _HOST_BLOCK_RE.finditer(rule):
         for h in _BACKTICK_RE.finditer(block.group(1)):
-            hosts.add(h.group(1))
+            hostname = h.group(1)
+            if _is_valid_fqdn(hostname):
+                hosts.add(hostname)
+            else:
+                log.warning("ignoring invalid hostname from label: %r", hostname)
     return hosts
 
 
@@ -115,7 +130,9 @@ BACKENDS     = build_backends(os.environ)
 
 
 def _heartbeat() -> None:
-    open(HEARTBEAT_FILE, "w").close()
+    fd = os.open(HEARTBEAT_FILE, os.O_CREAT | os.O_WRONLY | os.O_NOFOLLOW, 0o644)
+    os.close(fd)
+    os.utime(HEARTBEAT_FILE)
 
 
 def swarm_hosts(client: Any, backend_name: str, opt_in: bool = False) -> set[str]:
@@ -283,13 +300,16 @@ def event_loop(client: Any) -> None:
             backoff = 10
         except Exception as e:
             log.error("event stream error: %s — reconnecting in %ds", e, backoff)
-            time.sleep(backoff)
+            _shutdown.wait(backoff)
+            if _shutdown.is_set():
+                break
             backoff = min(backoff * 2, 300)
             _heartbeat()
 
 
 def _handle_sigterm(*_: Any) -> None:
     log.info("received SIGTERM")
+    _shutdown.set()
     sys.exit(0)
 
 
@@ -297,7 +317,11 @@ def main() -> None:
     global DOCKER_MODE
     signal.signal(signal.SIGTERM, _handle_sigterm)
     if METRICS_PORT:
-        _start_metrics(METRICS_PORT)
+        try:
+            _start_metrics(METRICS_PORT)
+        except OSError as e:
+            log.fatal("metrics server failed to start on :%d: %s", METRICS_PORT, e)
+            raise SystemExit(1) from None
         log.info("metrics server listening on :%d", METRICS_PORT)
     client = docker.from_env()
     if DOCKER_MODE == "auto":
